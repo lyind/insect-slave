@@ -2,7 +2,7 @@
 Minimal service discovery slave implementation implemented in C
 
 ## Dependencies
-* Unix like operating system
+* Unix like or Windows OS
 * C compiler
 
 ## Help
