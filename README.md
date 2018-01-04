@@ -12,7 +12,7 @@ insect-slave.c - Simple insect slave implementation
 
 USAGE:
 
-  insect-slave COMMAND
+  insect-slave [OPTIONS] COMMAND
 
 COMMANDS:
 
