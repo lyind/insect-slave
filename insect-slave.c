@@ -417,7 +417,7 @@ static int resolve_host_port(struct sockaddr_in *address, const char *host, uint
     if (host_entity == NULL)
     {
 		#ifndef _WIN32
-        perror(host);
+		(void) fprintf(stderr, "error: resolving %s: %s\n", host, hstrerror(h_errno));
 		#else
 		(void) fprintf(stderr, "error: resolving %s: error %d\n", host, WSAGetLastError());
 		#endif
@@ -512,7 +512,6 @@ static int createNonBlockingUDPSocket(struct sockaddr_in *bind_address, const ch
 	}
 	#endif
 	
-	struct sockaddr_in queen_address;
 	errno = 0;
 	if (resolve_host_port(bind_address, bind_host, bind_port))
 		return -1;
