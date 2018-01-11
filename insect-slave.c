@@ -52,6 +52,7 @@
 #include <time.h>
 #include <errno.h>
 
+#include "insect-types.h"
 
 #ifndef _WIN32
 
@@ -63,6 +64,8 @@
 #include <sys/time.h>
 #include <poll.h>
 #include <fcntl.h>
+
+#include "hostdb-unix.h"
 
 #else
 
@@ -83,90 +86,18 @@
 #endif
 #define poll(fdarray, nfds, timeout) WSAPoll(fdarray, nfds, timeout)
 
+#include "hostdb-windows.h"
+
 #endif
-
-
-#define BUFFER_SIZE 1500
-
-#define COUNT_OF(x) ((sizeof(x)/sizeof(0[x])) / ((size_t)(!(sizeof(x) % sizeof(0[x])))))
 
 // TODO Make this configurable.
 #define KEEP_ALIVE_INTERVAL_MICROS  1000000    // 1s
 
-
-typedef enum insect_message_type_e
-{
-    INSECT_MESSAGE_NONE = 0,
-    INSECT_MESSAGE_MAPPING = 1,
-    INSECT_MESSAGE_SHUTDOWN = 2,
-    INSECT_MESSAGE_INVALIDATE = 3
-}
-insect_message_type_t;
-
-
-/** Mapping message */
-typedef struct insect_mapping_s
-{
-    // all numeric fields are big-endian
-    uint8_t type;             // message type (1: mapping)
-    uint8_t flags;            // 0x0
-    uint8_t hostLength;       // length of bindAddress
-    uint8_t routeLength;      // length of route
-    int64_t ts;               // client System.nanoTime()
-    uint16_t port;            // client port
-    uint8_t nameLength;       // length of unique service name
-    uint8_t dependencyLength; // length of dependency
-    char data[];             // UTF-8 encoded data fields:
-    // 1. client IPv4 address/hostname as non-terminated UTF-8 string
-    // 2. route (exported path, non-terminated UTF-8 string)
-    // 3. unique service name (non-terminated UTF-8 string)
-    // 4. as single dependency to be subscribed (non-terminated UTF-8 string)
-}
-__attribute__((packed))
-insect_mapping_t;
-
-
-/** Shutdown command message */
-typedef struct insect_shutdown_s
-{
-    uint8_t type;             // message type (2: shutdown)
-    uint8_t magic;            // 0x86
-}
-__attribute__((packed))
-insect_shutdown_t;
-
-
-/** Invalidate command message */
-typedef struct insect_invalidate_s
-{
-    uint8_t type;             // message type (3: shutdown)
-    uint8_t magic;            // 0x73
-}
-__attribute__((packed))
-insect_invalidate_t;
-
-
-typedef union message_buffer_u
-{
-    char buffer[BUFFER_SIZE];
-    insect_mapping_t mapping;
-    insect_shutdown_t shutdown;
-    insect_invalidate_t invalidate;
-}
-__attribute__((packed))
-message_buffer_t;
-
+// TODO Make this dynamic or configurable
+#define DB_SIZE (sizeof(dependency_state_t) * 16)
 
 static message_buffer_t out = { 0 };
 static message_buffer_t in = { 0 };
-
-
-typedef struct dependency_state_s
-{
-	char route[256];
-	message_buffer_t state[16];  // TODO allocate this on demand or use a database
-}
-dependency_state_t;
 
 
 typedef enum insect_command_e
@@ -179,7 +110,6 @@ typedef enum insect_command_e
 insect_command_t;
 
 
-
 /** Callback that may handle received messages.
  * 
  * Messages are checked for validity at the point the callback is executed.
@@ -189,7 +119,7 @@ insect_command_t;
  * 
  * @return 0 if successful -1 if an error occured, 1 if the operation finished.
  */
-typedef int (incoming_message_cb)(const message_buffer_t *message, int size, uint_fast8_t type);
+typedef int (incoming_message_cb)(db_t *db, const message_buffer_t *message, int size, uint_fast8_t type);
 
 
 static insect_command_t command = COMMAND_NONE;
@@ -207,9 +137,9 @@ static uint16_t queen_port = 0;  // big-endian
 /**
  * Print help and exit.
  */
-static void commandHelp()
+static void commandHelp(db_t *db)
 {
-    (void) fputs("\n\
+    (void) fprintf(stderr, "\n\
  insect-slave.c - Simple insect slave implementation\n\
 \n\
 USAGE:\n\
@@ -226,39 +156,18 @@ OPTIONS:\n\
 \n\
    -h                    Show this help\n\
 \n\
-   -d DEPENDENCY_ROUTE   Slave dependency route (up to 16 allowed)\n\
+   -d DEPENDENCY_ROUTE   Slave dependency route (up to %u allowed)\n\
    -n UNIQUE_SLAVE_NAME  Slave route\n\
    -p SLAVE_PORT         Slave port\n\
    -P QUEEN_PORT         Remote queen port\n\
    -q QUEEN_HOST         Remote queen hostname or address\n\
    -r ROUTE              Slave route\n\
-   -s SLAVE_HOST         Slave host address or name\n", stderr);
-}
-
-
-/** Convert 64-bit integer from host order to big-endian, if necessary. */
-static inline uint64_t htonll(uint64_t n)
-{
-#if __BYTE_ORDER == __BIG_ENDIAN
-    return n;
-#else
-    return (((uint64_t)htonl(n)) << 32) + htonl(n >> 32);
-#endif
-}
-
-/** Convert 64-bit integer from big-endian to host order, if necessary. */
-static inline uint64_t ntohll(uint64_t n)
-{
-#if __BYTE_ORDER == __BIG_ENDIAN
-    return n;
-#else
-    return (((uint64_t)ntohl(n)) << 32) + ntohl(n >> 32);
-#endif
+   -s SLAVE_HOST         Slave host address or name\n", db_entry_count(db));
 }
 
 
 /** Parse command line arguments. */
-static int parse_args(int argc, char *argv[])
+static int parse_args(db_t *db, int argc, char *argv[])
 {
 	errno = 0;
     opterr = 0;
@@ -276,19 +185,9 @@ static int parse_args(int argc, char *argv[])
             
             case 'd':
             {
-                unsigned i = 0;
-                for (; i < COUNT_OF(dependencies); ++i)
+                if (!db_insert_dependency_route(db, optarg))
                 {
-                    if (dependencies[i].route[0] == '\0')
-                    {
-                        (void) strncpy(dependencies[i].route, optarg, sizeof(dependencies[0].route) - 1);
-                        break;
-                    }
-                }
-                
-                if (i >= COUNT_OF(dependencies))
-                {
-                    (void) fputs("error: Too many dependencies specified (maximum: 16)\n", stderr);
+                    (void) fprintf(stderr, "error: Too many dependencies specified (maximum: %u)\n", db_entry_count(db));
                     return -1;
                 }
 
@@ -624,101 +523,6 @@ static int assembleMappingMessage(const char *dependency)
 }
 
 
-static dependency_state_t *findDependencyByRoute(const char *route)
-{
-	// TODO Skip timed out entries
-    const int routeLength = route ? strlen(route) : 0;
-    
-	for (unsigned i = 0; i < COUNT_OF(dependencies) && dependencies[i].route[0] != '\0'; ++i)
-	{
-		if (strlen(dependencies[i].route) == routeLength
-            && strncmp(dependencies[i].route, route, routeLength) == 0)
-		{
-			return dependencies + i;
-		}
-	}
-	
-	return NULL;
-}
-
-
-static const dependency_state_t *findFirstUnresolved()
-{
-	// TODO Skip timed out entries
-	unsigned i = 0;
-	for (; i < COUNT_OF(dependencies) && dependencies[i].route[0]; ++i)
-	{
-		if (!dependencies[i].state[0].mapping.type)
-		{
-			return dependencies + i;
-		}
-	}
-	
-	return NULL;
-}
-
-
-static unsigned countUnresolvedDependencies()
-{
-    // TODO Skip timed out entries
-	int count = 0;
-	for (unsigned i = 0; i < COUNT_OF(dependencies) && dependencies[i].route[0]; ++i)
-	{
-        // have no candidate yet? count.
-		if (dependencies[i].state[0].mapping.type != INSECT_MESSAGE_MAPPING)
-		{
-			++count;
-		}
-	}
-    
-    return count;
-}
-
-
-static int printResolvedDependencies()
-{
-    // TODO Skip timed out entries
-	for (unsigned i = 0; i < COUNT_OF(dependencies) && dependencies[i].route[0]; ++i)
-	{
-        for (unsigned j = 0; j < COUNT_OF(dependencies[0].state); ++j)
-        {
-            const insect_mapping_t *mapping = &dependencies[i].state[j].mapping;
-            
-            if (mapping->type == INSECT_MESSAGE_MAPPING)
-            {
-                // find field offsets
-                const char *host = mapping->data;
-                const char *route = mapping->data + mapping->hostLength;
-                const char *name = mapping->data + mapping->hostLength + mapping->routeLength;
-                
-                const int bytesWritten = fprintf(stdout, "%.*s\t%.*s\t%.*s\t%hu\t%" PRId64 "\n",
-                    mapping->routeLength,
-                    route,
-                    mapping->nameLength,
-                    name,
-                    mapping->hostLength,
-                    host,
-                    ntohs(mapping->port),
-                    ntohll(mapping->ts));
-
-                if (bytesWritten <= 0)
-                {
-                    perror("writing lookup results");
-                    return -1;
-                }
-            }
-            else
-            {
-                // next dependency
-                break;
-            }
-        }
-	}
-    
-    return 0;
-}
-
-
 static int parseMessageMapping(int size)
 {
     const uint8_t type = in.mapping.type;        
@@ -796,7 +600,7 @@ static int parseMessageInvalidate(int size)
 }
 
 
-static int handleIncomingMessage(incoming_message_cb message_callback, int size)
+static int handleIncomingMessage(db_t *db, incoming_message_cb message_callback, int size)
 {
     if (size > 1 && size <= sizeof(in.buffer))
     {
@@ -806,7 +610,7 @@ static int handleIncomingMessage(incoming_message_cb message_callback, int size)
             || !parseMessageShutdown(size)
             || !parseMessageInvalidate(size))
         {
-            return message_callback(&in, size, type);
+            return message_callback(db, &in, size, type);
         }
         else
         {
@@ -822,16 +626,10 @@ static int handleIncomingMessage(incoming_message_cb message_callback, int size)
 }
 
 
-static int trySendKeepAlive(int sock, const struct sockaddr_in *destination_remote_address)
+static int trySendKeepAlive(db_t *db, int sock, const struct sockaddr_in *destination_remote_address)
 {
-	// TODO Assemble keep-alive message in out.mapping
-	// find first unresolved dependency and attach to mapping
-	const dependency_state_t *unresolvedDependency = findFirstUnresolved();
-	if (unresolvedDependency)
-    {
-        (void) fprintf(stderr, "info: resolving dependency: %s\n", unresolvedDependency->route);
-    }
-    
+	/* find first unresolved dependency and attach to mapping */
+	const dependency_state_t *unresolvedDependency = db_find_dependency_unresolved(db);
 	const int messageSize = assembleMappingMessage(unresolvedDependency ? unresolvedDependency->route : NULL);
 	
 	errno = 0;
@@ -865,7 +663,7 @@ static int trySendKeepAlive(int sock, const struct sockaddr_in *destination_remo
 }
 
 
-static int exchangeMessages(incoming_message_cb callback, struct sockaddr_in *queen_address, int sock)
+static int exchangeMessages(db_t *db, incoming_message_cb callback, struct sockaddr_in *queen_address, int sock)
 {
 	int64_t now = timeMicros();
 	int64_t nextKeepalive = now;
@@ -904,7 +702,7 @@ static int exchangeMessages(incoming_message_cb callback, struct sockaddr_in *qu
 		#endif
 		{
 			// timeout, try to send keep-alive immediately
-			sentKeepAliveSize = trySendKeepAlive(sock, queen_address);
+			sentKeepAliveSize = trySendKeepAlive(db, sock, queen_address);
 			//fprintf(stderr, "trySendKeepAlive(): %d\n", sentKeepAliveSize);
 			if (sentKeepAliveSize < 0)
 			{
@@ -922,7 +720,7 @@ static int exchangeMessages(incoming_message_cb callback, struct sockaddr_in *qu
             //fprintf(stderr, "tryRecv(): %d\n", receivedSize);
 			if (receivedSize > 0)
 			{
-				int result = handleIncomingMessage(callback, receivedSize);
+				int result = handleIncomingMessage(db, callback, receivedSize);
                 if (result < 0)
                 {
                     return -1;
@@ -956,63 +754,46 @@ static int exchangeMessages(incoming_message_cb callback, struct sockaddr_in *qu
  * 
  * @return Pointer to the updated dependency or NULL.
  */
-static const dependency_state_t *handleMapping(const insect_mapping_t *mapping, int size)
+static const dependency_state_t *handleMapping(db_t *db, const insect_mapping_t *mapping, int size)
 {
     // parse route
     char route[256] = {0};
     (void) strncpy(route, mapping->data + mapping->hostLength, mapping->routeLength);
     
-    // find dependency and update its state
-    dependency_state_t *dependency_state = findDependencyByRoute(route);
-    if (dependency_state == NULL)
+    // parse host from mapping
+    char host[256] = {0};
+    (void) strncpy(host, mapping->data, mapping->hostLength);
+
+    // keep in network byte order
+    const uint16_t port = mapping->port;
+
+    const dependency_state_t *updated_dependency = db_update_dependency_state_for_host(db, route, host, port, mapping, size);
+    if (!updated_dependency)
     {
         (void) fprintf(stderr, "info: ignoring mapping for unneeded route %s\n", route);
         return NULL;
     }
     
-    // parse host
-    char host[256] = {0};
-    (void) strncpy(route, mapping->data, mapping->hostLength);
-    
-    // find first record matching address or first free record and overwrite
-    for (message_buffer_t *state = dependency_state->state;
-        state < dependency_state->state + COUNT_OF(dependency_state->state);
-        ++state)
-    {
-        if (state->mapping.type != INSECT_MESSAGE_MAPPING
-            || (state->mapping.port == mapping->port
-                && mapping->hostLength == state->mapping.hostLength
-                && strncmp(state->mapping.data, host, mapping->hostLength) == 0))
-        {
-            // found slot, copy
-            memcpy(state->buffer, mapping, size);
-            return dependency_state;
-        }
-    }
-    
-    return NULL;
+    return updated_dependency;
 }
 
 
-static void handleInvalidate()
+static void handleInvalidate(db_t *db)
 {
     (void) fprintf(stderr, "info: invalidating all resolved dependencies\n");
     
     // remove all information about slaves
-    for (unsigned i = 0; i < COUNT_OF(dependencies); ++i)
-    {
-        memset(&dependencies[i].state, 0, sizeof(dependencies[0].state));
-    }
+    db_delete_dependency_state(db);
 }
 
 
-static int commandKeepAliveMessageHandler(const message_buffer_t *message, int size, uint_fast8_t type)
+static int commandKeepAliveMessageHandler(db_t *db, const message_buffer_t *message, int size, uint_fast8_t type)
 {
     switch(type)
     {
         case INSECT_MESSAGE_MAPPING:
         {
-            (void) handleMapping(&message->mapping, size);
+            (void) handleMapping(db, &message->mapping, size);
             break;
         }
         
@@ -1024,48 +805,7 @@ static int commandKeepAliveMessageHandler(const message_buffer_t *message, int s
         
         case INSECT_MESSAGE_INVALIDATE:
         {
-            handleInvalidate();
-            break;
-        }
-        
-        default:
-            break;
-    }
-    
-    return 0;
-}
-
-
-static int commandLookupMessageHandler(const message_buffer_t *message, int size, uint_fast8_t type)
-{
-    switch(type)
-    {
-        case INSECT_MESSAGE_MAPPING:
-        {
-            const dependency_state_t *dependency_state = handleMapping(&message->mapping, size);
-            if (dependency_state != NULL)
-            {
-                // check if all requested dependencies have been resolved
-                int unresolvedCount = countUnresolvedDependencies();
-                if (unresolvedCount == 0)
-                {
-                    // dump all results
-                    return printResolvedDependencies() ? -1 : 1;
-                }
-            }
-            
-            break;
-        }
-        
-        case INSECT_MESSAGE_SHUTDOWN:
-        {
-            (void) fprintf(stderr, "info: planned remote shutdown\n");
-            return 1;
-        }
-        
-        case INSECT_MESSAGE_INVALIDATE:
-        {
-            handleInvalidate();
+            handleInvalidate(db);
             break;
         }
         
@@ -1079,50 +819,87 @@ static int commandLookupMessageHandler(const message_buffer_t *message, int size
 
 int main(int argc, char **argv)
 {
-	int code = parse_args(argc, argv);
+    db_t db = { 0 };
+    db.size = DB_SIZE;
+
+    if (db_open_readwrite(&db))
+    {
+        (void) fputs("error: failed to open database\n", stderr);
+        return 1;
+    }
+
+	int code = parse_args(&db, argc, argv);
 	if (command == COMMAND_HELP)
 	{
-		commandHelp();
+		commandHelp(&db);
 	}
 	else if (!code)
 	{
-		struct sockaddr_in slave_address;
-		const int sock = createNonBlockingUDPSocket(&slave_address, slave_host, slave_port);
-		if (sock < 0)
-			return 1;
-	
-		// arguments parsed ok and some regular command requiring network access
-		struct sockaddr_in queen_address;
-		if (resolve_host_port(&queen_address, queen_host, queen_port))
-			return 1;
-		
-		switch(command)
-		{
-			case COMMAND_KEEP_ALIVE:
-			{
-				code = exchangeMessages(commandKeepAliveMessageHandler, &queen_address, sock) ? 1 : 0;
-				break;
-			}
+        switch(command)
+        {
+            case COMMAND_KEEP_ALIVE:
+            {
+                struct sockaddr_in slave_address;
+                const int sock = createNonBlockingUDPSocket(&slave_address, slave_host, slave_port);
+                if (sock >= 0)
+                {
+                    // arguments parsed ok and some regular command requiring network access
+                    struct sockaddr_in queen_address;
+                    if (!resolve_host_port(&queen_address, queen_host, queen_port))
+                    {
+                        code = exchangeMessages(&db, commandKeepAliveMessageHandler, &queen_address, sock) ? 1 : 0;
+                    }
+                    else
+                    {
+                        code = 1;
+                    }
+
+                    close(sock);
+                }
+                else
+                {
+                    code = 1;
+                }
+                
+                #ifdef _WIN32
+                WSACleanup();
+                #endif
+
+                break;
+            }
             
             case COMMAND_LOOKUP:
             {
-                code = exchangeMessages(commandLookupMessageHandler, &queen_address, sock) ? 1 : 0;
+                code = 1;
+                do
+                {
+                    // check if all requested dependencies have been resolved
+                    int unresolvedCount = db_count_dependencies_unresolved(&db);
+                    if (unresolvedCount == 0)
+                    {
+                        // dump all results
+                        code = db_print_dependencies_resolved(&db) ? 1 : 0;
+                        break;
+                    }
+
+                    // TODO Implement db_notification and db_lock, db_unlock
+                    sleep(1);
+                }
+                while(1);
+
                 break;
             }
-			
-			default:
-			{
-				(void) fputs("error: command not implemented, yet", stderr);
-				code = 1;
-			}
-		}
-		
-		close(sock);
-		
-		#ifdef _WIN32
-		WSACleanup();
-		#endif
+            
+            default:
+            {
+                (void) fputs("error: command not implemented, yet", stderr);
+                code = 1;
+            }
+        }
 	}
+
+    db_close(&db);
 
     return code;
 }
+
