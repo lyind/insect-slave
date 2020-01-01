@@ -19,10 +19,13 @@
 
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <time.h>
+#include <stdlib.h>
 #include <syslog.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 
 #include "insect-types.h"
 
@@ -65,6 +68,28 @@ static inline void exit_syslog(const char *fmt, ...)
 }
 
 
+static inline bool db_lock(db_t *db, bool writable)
+{
+    struct flock lock;
+    lock.l_type = writable ? F_WRLCK : F_RDLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    return fcntl(db->fd, F_SETLKW, &lock) == 0;
+}
+
+
+static inline bool db_unlock(db_t *db)
+{
+    struct flock lock;
+    lock.l_type = F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    return fcntl(db->fd, F_SETLK, &lock) == 0;
+}
+
+
 static inline unsigned db_entry_count(db_t *db)
 {
     if (db->fd <= 0)
@@ -76,6 +101,11 @@ static inline unsigned db_entry_count(db_t *db)
 
 static inline dependency_state_t *db_insert_dependency_route(db_t *db, const char *route)
 {
+    if (!db_lock(db, true))
+    {
+        return NULL;
+    }
+
 	// TODO Skip timed out entries
     int route_length = route ? strlen(route) : 0;
     if (route_length >= sizeof(db->record[0].route))
@@ -83,20 +113,29 @@ static inline dependency_state_t *db_insert_dependency_route(db_t *db, const cha
         --route_length;
     }
     
+    dependency_state_t *dependency = NULL;
     for (unsigned i = 0; i < db_entry_count(db); ++i)
     {
         if (strncmp(db->record[i].route, route, route_length) == 0)
         {
-            return db->record + i;
+            dependency = db->record + i;
+            break;
         }
         else if (db->record[i].route[0] == '\0')
         {
+            // initialize
             (void) strncpy(db->record[i].route, route, route_length);
-            return db->record + i;
+            dependency = db->record + i;
+            break;
         }
     }
 
-	return NULL;
+    if (!db_unlock(db))
+    {
+        return NULL;
+    }
+
+	return dependency;
 }
 
 
@@ -117,54 +156,108 @@ static inline dependency_state_t *db_find_dependency_by_route(db_t *db, const ch
 }
 
 
+static inline int db_compare_state_by_timestamp(const void *a, const void *b)
+{
+    const insect_mapping_t *m1 = &((const message_buffer_t*)a)->mapping;
+    const insect_mapping_t *m2 = &((const message_buffer_t*)b)->mapping;
+
+    const int64_t ts1 = (m1->type == INSECT_MESSAGE_MAPPING) ? ntohll(m1->ts) : INT64_MIN;
+    const int64_t ts2 = (m2->type == INSECT_MESSAGE_MAPPING) ? ntohll(m2->ts) : INT64_MIN;
+
+    if (ts1 < ts2)
+    {
+        return 1;
+    }
+    else if (ts1 > ts2)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+
 static inline dependency_state_t *db_update_dependency_state_for_host(db_t *db, const char *route, const char *host, uint16_t port, const insect_mapping_t *mapping, int size)
 {
-    const int host_length = (host) ? strlen(host) : 0;
-
-    // find dependency and update its state
-    dependency_state_t *dependency_state = db_find_dependency_by_route(db, route);
-    if (dependency_state == NULL)
+    if (!db_lock(db, true))
     {
         return NULL;
     }
-    
-    // find first record matching address or first free record and overwrite
-    for (message_buffer_t *state = dependency_state->state;
-        state < dependency_state->state + COUNT_OF(dependency_state->state);
-        ++state)
+
+    // find dependency and update its state
+    dependency_state_t *dependency = db_find_dependency_by_route(db, route);
+    if (dependency != NULL)
     {
-        if (state->mapping.type != INSECT_MESSAGE_MAPPING
-            || (state->mapping.port == port
-                && host_length == state->mapping.hostLength
-                && strncmp(state->mapping.data, host, host_length) == 0))
+        // find first record matching address or first free record and overwrite
+        const int host_length = (host) ? strlen(host) : 0;
+        message_buffer_t *state = dependency->state;
+        for (; state < dependency->state + COUNT_OF(dependency->state); ++state)
         {
-            // found slot, copy
-            memcpy(state->buffer, mapping, size);
-            return dependency_state;
+            if (state->mapping.type != INSECT_MESSAGE_MAPPING
+                || (state->mapping.port == port
+                    && host_length == state->mapping.hostLength
+                    && strncmp(state->mapping.data, host, host_length) == 0))
+            {
+                // found slot, copy
+                memcpy(state->buffer, mapping, size);
+                break;
+            }
         }
+
+        if (state >= dependency->state + COUNT_OF(dependency->state))
+        {
+            // found no free or mergable slot, replace oldest entry
+            memset(dependency->state + COUNT_OF(dependency->state) - 1, 0, sizeof(*dependency->state));
+            memcpy((dependency->state + COUNT_OF(dependency->state) - 1)->buffer, mapping, size);
+        }
+
+        // sort by timestamp
+        qsort(dependency->state, COUNT_OF(dependency->state), sizeof(*dependency->state), db_compare_state_by_timestamp);
     }
 
-    return NULL;
+    if (!db_unlock(db))
+    {
+        return NULL;
+    }
+
+    return dependency;
 }
 
 
 static inline const dependency_state_t *db_find_dependency_unresolved(db_t *db)
 {
+    if (!db_lock(db, false))
+    {
+        return NULL;
+    }
+
 	// TODO Skip timed out entries
+    dependency_state_t *dependency = NULL;
 	for (unsigned i = 0; i < db_entry_count(db) && db->record[i].route[0]; ++i)
 	{
 		if (!db->record[i].state[0].mapping.type)
 		{
-			return db->record + i;
+			dependency = db->record + i;
+            break;
 		}
 	}
 	
-	return NULL;
+    if (!db_unlock(db))
+    {
+        return NULL;
+    }
+
+	return dependency;
 }
 
 
 static inline unsigned db_count_dependencies_unresolved(db_t *db)
 {
+    if (!db_lock(db, false))
+    {
+        return UINT_MAX;
+    }
+
     // TODO Skip timed out entries
 	unsigned count = 0;
 	for (unsigned i = 0; i < db_entry_count(db) && db->record[i].route[0]; ++i)
@@ -176,21 +269,35 @@ static inline unsigned db_count_dependencies_unresolved(db_t *db)
 		}
 	}
     
+    if (!db_unlock(db))
+    {
+        return UINT_MAX;
+    }
+
     return count;
 }
 
 
 static inline void db_delete_dependency_state(db_t *db)
 {
+    db_lock(db, true);
+
     for (unsigned i = 0; i < db_entry_count(db); ++i)
     {
-        memset(&db->record[i].state, 0, sizeof(db->record[0].state));
+        memset(db->record[i].state, 0, sizeof(db->record[0].state));
     }
+
+    db_unlock(db);
 }
 
 
-static int db_print_dependencies_resolved(db_t *db)
+static bool db_print_dependencies_resolved(db_t *db)
 {
+    if (!db_lock(db, false))
+    {
+        return false;
+    }
+
     // TODO Skip timed out entries
 	for (unsigned i = 0; i < db_entry_count(db) && db->record[i].route[0]; ++i)
 	{
@@ -218,7 +325,8 @@ static int db_print_dependencies_resolved(db_t *db)
                 if (bytesWritten <= 0)
                 {
                     perror("writing lookup results");
-                    return -1;
+                    db_unlock(db);
+                    return false;
                 }
             }
             else
@@ -228,8 +336,8 @@ static int db_print_dependencies_resolved(db_t *db)
             }
         }
 	}
-    
-    return 0;
+
+    return db_unlock(db);
 }
 
 

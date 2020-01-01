@@ -128,7 +128,6 @@ typedef union message_buffer_u
 __attribute__((packed))
 message_buffer_t;
 
-
 typedef struct dependency_state_s
 {
 	char route[256];

@@ -128,7 +128,6 @@ static char slave_host[256] = { '\0' };
 static char slave_route[256] = { '\0' };
 static char slave_name[256] = { '\0' };
 static char queen_host[256] = { '\0' };
-static dependency_state_t dependencies[16] = { 0 };
 
 static uint16_t slave_port = 0;  // big-endian
 static uint16_t queen_port = 0;  // big-endian
@@ -878,7 +877,7 @@ int main(int argc, char **argv)
                     if (unresolvedCount == 0)
                     {
                         // dump all results
-                        code = db_print_dependencies_resolved(&db) ? 1 : 0;
+                        code = db_print_dependencies_resolved(&db) ? 0 : 1;
                         break;
                     }
 
