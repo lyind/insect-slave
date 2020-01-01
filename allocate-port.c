@@ -108,7 +108,7 @@ static int resolve_primary_address(struct sockaddr *primary_address, int primary
 /**
  * Create an outgoing UDP socket (to a test address) and return its local IP.
  */
-static int resolve_primary_address(const char *reachable_ipv4, struct sockaddr_in *primary_address, int primary_address_size)
+static int resolve_primary_address(const char *reachable_ipv4, struct sockaddr_in *primary_address, socklen_t primary_address_size)
 {
     errno = 0;
     const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
